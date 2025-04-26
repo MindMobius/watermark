@@ -13,7 +13,7 @@ import random
 # Or instruct users clearly they MUST upload one for Chinese text.
 # SimHei is common on Windows, Arial Unicode MS, or Noto Sans CJK are good alternatives.
 # Let's assume a generic name, user MUST provide if default doesn't exist/work.
-DEFAULT_FONT_PATH = "msyh.ttc" # Example: Microsoft YaHei path (adjust for your system or use upload)
+DEFAULT_FONT_PATH = "ali.ttf" # Example: Microsoft YaHei path (adjust for your system or use upload)
 DEFAULT_OUTPUT_DIR = "output_videos"
 
 # --- Helper Functions ---
