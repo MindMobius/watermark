@@ -14,13 +14,47 @@ DEFAULT_OUTPUT_DIR = "output_videos"
 # --- Watermark Generation ---
 
 def hex_to_rgba(hex_color, alpha=255):
-    """Converts hex color string to (R, G, B, A) tuple."""
-    if not hex_color.startswith('#'):
-        raise ValueError("Hex color must start with #")
+    """Converts hex color string to (R, G, B, A) tuple. Also supports rgba() format."""
+    if not hex_color:
+        raise ValueError("Color cannot be empty")
         
+    # Handle rgba() format
+    if hex_color.lower().startswith('rgba(') and hex_color.endswith(')'):
+        try:
+            parts = [p.strip() for p in hex_color[5:-1].split(',')]
+            if len(parts) != 4:
+                raise ValueError("RGBA format requires exactly 4 values")
+            
+            # 处理可能的大于1的RGB值
+            r = float(parts[0])
+            g = float(parts[1])
+            b = float(parts[2])
+            
+            # 如果值大于1，假设是0-255范围的值，转换为0-1范围
+            if r > 1 or g > 1 or b > 1:
+                r = r / 255.0
+                g = g / 255.0
+                b = b / 255.0
+                
+            # 转换为整数并验证范围
+            r = int(r * 255)
+            g = int(g * 255)
+            b = int(b * 255)
+            a = int(float(parts[3]) * 255)  # 转换0-1 alpha到0-255
+            
+            if not all(0 <= x <= 255 for x in (r, g, b, a)):
+                raise ValueError("RGBA值必须在0-255范围内")
+                
+            return (r, g, b, a)
+        except Exception as e:
+            raise ValueError(f"无效的RGBA颜色格式: {hex_color}. 期望rgba(r,g,b,a)其中r,g,b在0-1或0-255范围内. 错误: {e}")
+    
+    # Original hex color handling
+    if not hex_color.startswith('#'):
+        hex_color = '#' + hex_color
+    
     hex_color = hex_color.lstrip('#')
     
-    # Validate length and characters
     if len(hex_color) not in (3, 6):
         raise ValueError(f"Invalid hex color length (must be 3 or 6 chars after #): {hex_color}")
         
