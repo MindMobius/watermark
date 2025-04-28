@@ -7,7 +7,9 @@ import os
 import time
 import math
 import random
-import multiprocessing
+# import multiprocessing # Removed for sequential processing
+import subprocess # Added for ffmpeg
+import shutil # Added for checking ffmpeg path
 from pathlib import Path # For easier path handling
 
 # --- Configuration ---
@@ -57,6 +59,10 @@ def apply_opacity(img, opacity_percent):
     new_alpha = alpha_channel.point(lambda p: max(0, min(255, int(p * opacity_factor))))
     img.putalpha(new_alpha)
     return img
+
+def is_ffmpeg_available():
+    """Checks if ffmpeg command is available in PATH."""
+    return shutil.which("ffmpeg") is not None
 
 # --- Watermark Generation ---
 
@@ -285,6 +291,7 @@ class WatermarkMover:
                 self.dy = -abs(self.dy) if self.dy != 0 else (-random.randint(1, max(1, int(self.frame_height * 0.005 * self.speed_factor)))) if self.max_y > self.min_y else 0
                 bounced = True
 
+            # Clamp values strictly within bounds after bounce calculation
             self.x = max(self.min_x, min(self.x, self.max_x))
             self.y = max(self.min_y, min(self.y, self.max_y))
 
@@ -296,7 +303,7 @@ class WatermarkMover:
             center_x = self.min_x + amplitude
             frequency = 1.0 * self.speed_factor
             current_x = center_x + amplitude * math.sin(2 * math.pi * frequency * progress)
-            current_y = self.min_y + max(0, (self.max_y - self.min_y) / 2)
+            current_y = self.min_y + max(0, (self.max_y - self.min_y) / 2) # Center vertically
             return int(max(self.min_x, min(current_x, self.max_x))), int(current_y)
 
         elif self.path_type == "垂直移动":
@@ -305,7 +312,7 @@ class WatermarkMover:
             center_y = self.min_y + amplitude
             frequency = 1.0 * self.speed_factor
             current_y = center_y + amplitude * math.sin(2 * math.pi * frequency * progress)
-            current_x = self.min_x + max(0, (self.max_x - self.min_x) / 2)
+            current_x = self.min_x + max(0, (self.max_x - self.min_x) / 2) # Center horizontally
             return int(current_x), int(max(self.min_y, min(current_y, self.max_y)))
 
         else:
@@ -315,8 +322,8 @@ class WatermarkMover:
 
 # --- Core Video Processing ---
 
-def add_watermark_to_video(input_video_path, output_video_path, watermark_pil, mover):
-    """将准备好的水印 PIL 图像添加到视频的每一帧。 (No Gradio Progress here)"""
+def add_watermark_to_video(input_video_path, silent_output_path, watermark_pil, mover):
+    """将准备好的水印 PIL 图像添加到视频的每一帧，输出为 *无音频* 的视频。"""
     cap = cv2.VideoCapture(str(input_video_path)) # Use string path
     if not cap.isOpened():
         raise IOError(f"错误: 打开视频文件失败: {input_video_path}")
@@ -333,16 +340,17 @@ def add_watermark_to_video(input_video_path, output_video_path, watermark_pil, m
     # Update mover with actual total frames if available
     mover.update_total_frames(total_frames)
 
-    # Ensure watermark fits (resize if necessary) - Should be done *before* mover init usually,
-    # but mover is already initialized. If we resize here, bounds *might* be slightly off
-    # if the watermark was initially too large. Ideally, resize happens before mover creation.
-    # Let's assume watermark passed is already appropriately sized (handled in worker).
+    # Ensure watermark fits (should ideally be handled before mover init, but safety check)
+    if watermark_pil.width > frame_width or watermark_pil.height > frame_height:
+         print(f"警告 (内部): 水印尺寸 ({watermark_pil.width}x{watermark_pil.height}) 大于帧尺寸 ({frame_width}x{frame_height}).")
+         # We proceed, assuming the caller handled resizing or accepts clipping
 
+    # Choose a common codec like mp4v (H.264 often needs specific ffmpeg backend)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(str(output_video_path), fourcc, fps, (frame_width, frame_height)) # Use string path
+    out = cv2.VideoWriter(str(silent_output_path), fourcc, fps, (frame_width, frame_height)) # Use string path
     if not out.isOpened():
         cap.release()
-        raise IOError(f"错误: 无法创建输出视频文件: {output_video_path}")
+        raise IOError(f"错误: 无法创建临时输出视频文件: {silent_output_path}")
 
     frame_count = 0
     start_time = time.time()
@@ -351,12 +359,16 @@ def add_watermark_to_video(input_video_path, output_video_path, watermark_pil, m
     # Pre-check if watermark has any non-transparent pixels
     has_visible_watermark = False
     if watermark_pil.mode == 'RGBA':
-        alpha_min, alpha_max = watermark_pil.getextrema()[3]
-        if alpha_max > 0: # Check if maximum alpha is greater than 0
-             has_visible_watermark = True
+        try:
+             alpha_min, alpha_max = watermark_pil.getextrema()[3]
+             if alpha_max > 0: # Check if maximum alpha is greater than 0
+                 has_visible_watermark = True
+        except IndexError: # Handle cases like single-color images maybe?
+             has_visible_watermark = True # Assume visible if alpha check fails
     else: # If not RGBA, assume it's visible
          has_visible_watermark = True
 
+    print(f"  开始处理帧 (为 {Path(input_video_path).name})...")
     while True:
         ret, frame_bgr = cap.read()
         if not ret:
@@ -371,7 +383,6 @@ def add_watermark_to_video(input_video_path, output_video_path, watermark_pil, m
                 wm_x = max(0, min(int(wm_x), frame_width - watermark_pil.width))
                 wm_y = max(0, min(int(wm_y), frame_height - watermark_pil.height))
 
-                # Optimized pasting: Avoid creating full overlay if possible
                 # Paste directly onto the frame copy using the mask
                 pil_frame.paste(watermark_pil, (wm_x, wm_y), mask=watermark_pil)
 
@@ -392,20 +403,70 @@ def add_watermark_to_video(input_video_path, output_video_path, watermark_pil, m
         if frame_count % log_interval == 0:
              elapsed = time.time() - start_time
              rate = frame_count / elapsed if elapsed > 0 else 0
-             print(f"  文件 {Path(input_video_path).name}: 已处理 {frame_count} / {total_frames if total_frames > 0 else '?'} 帧 ({rate:.1f} fps)")
+             print(f"    文件 {Path(input_video_path).name}: 已处理 {frame_count} / {total_frames if total_frames > 0 else '?'} 帧 ({rate:.1f} fps)")
 
     cap.release()
     out.release()
 
     end_time = time.time()
     duration = end_time - start_time
-    print(f"完成处理 {Path(input_video_path).name}。耗时: {duration:.2f} 秒")
+    print(f"  完成帧处理 {Path(input_video_path).name}。耗时: {duration:.2f} 秒")
 
 
-# --- Multiprocessing Worker Function ---
+def _combine_video_audio_ffmpeg(silent_video_path, original_video_path, final_output_path):
+    """Uses ffmpeg to combine silent video with original audio."""
+    print(f"  使用 FFmpeg 合并音频从 {Path(original_video_path).name} 到 {Path(final_output_path).name}...")
+    # Command attempts to copy video (-c:v copy), copy audio (-c:a copy).
+    # -map 0:v:0 maps video from first input (silent video)
+    # -map 1:a:0 maps audio from second input (original video)
+    # -shortest finishes when the shorter stream ends (important if lengths differ slightly)
+    # '?' after stream specifier (like a:?) makes the mapping optional (prevents error if original has no audio)
+    cmd = [
+        'ffmpeg',
+        '-i', str(silent_video_path),    # Input 0: Silent watermarked video
+        '-i', str(original_video_path),  # Input 1: Original video (for audio)
+        '-c:v', 'copy',                  # Copy video stream directly
+        '-c:a', 'copy',                  # Copy audio stream directly
+        '-map', '0:v:0',                 # Map video from input 0
+        '-map', '1:a:0?',                # Map audio from input 1 (if it exists)
+        '-shortest',                     # Finish encoding based on shortest input
+        '-y',                            # Overwrite output without asking
+        str(final_output_path)
+    ]
+
+    try:
+        # Use stderr=subprocess.PIPE to capture potential ffmpeg errors/warnings
+        # Use stdout=subprocess.PIPE to suppress normal ffmpeg output unless debugging
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8')
+        print(f"  FFmpeg 合并成功: {Path(final_output_path).name}")
+        # Uncomment below to see ffmpeg's full output during success
+        # print("--- FFmpeg Output ---")
+        # print(result.stdout)
+        # print(result.stderr)
+        # print("---------------------")
+        return True, ""
+    except subprocess.CalledProcessError as e:
+        error_message = (
+            f"错误: FFmpeg 合并音频失败 (返回码 {e.returncode})。\n"
+            f"  命令: {' '.join(cmd)}\n"
+            f"  FFmpeg 输出 (stderr):\n{e.stderr}"
+        )
+        print(error_message) # Print detailed error
+        return False, error_message
+    except FileNotFoundError:
+        error_message = "错误: FFmpeg 命令未找到。请确保 FFmpeg 已安装并在系统 PATH 中。"
+        print(error_message)
+        return False, error_message
+    except Exception as e:
+        error_message = f"错误: 执行 FFmpeg 时发生意外错误: {e}"
+        print(error_message)
+        return False, error_message
+
+
+# --- Worker Function (Sequential Processing) ---
 
 def process_single_video_worker(args):
-    """Worker function to process one video file."""
+    """Worker function to process one video file sequentially."""
     (
         input_path_str, output_dir_str, watermark_params, motion_params, common_params
     ) = args
@@ -414,17 +475,20 @@ def process_single_video_worker(args):
     output_dir = Path(output_dir_str)
     base_filename = input_path.stem
     safe_filename_base = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in base_filename) + "_watermarked"
-    output_ext = ".mp4"
+    output_ext = ".mp4" # Keep as mp4
 
-    # --- Unique Filename Logic ---
-    output_path = output_dir / f"{safe_filename_base}{output_ext}"
+    # --- Unique Filename Logic for FINAL output ---
+    final_output_path = output_dir / f"{safe_filename_base}{output_ext}"
     counter = 1
-    while output_path.exists():
-        output_path = output_dir / f"{safe_filename_base}_{counter}{output_ext}"
+    while final_output_path.exists():
+        final_output_path = output_dir / f"{safe_filename_base}_{counter}{output_ext}"
         counter += 1
     # --- End Unique Filename Logic ---
 
-    status_message = f"开始处理: {input_path.name} -> {output_path.name}\n"
+    # Generate temporary silent video path based on final path
+    temp_silent_path = final_output_path.with_name(f"{final_output_path.stem}_temp_silent{output_ext}")
+
+    status_message = f"开始处理: {input_path.name} -> {final_output_path.name}\n"
     print(status_message.strip()) # Log start to console
 
     try:
@@ -434,7 +498,6 @@ def process_single_video_worker(args):
             raise IOError(f"无法打开视频 '{input_path.name}' 以获取尺寸。")
         vid_width = int(temp_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         vid_height = int(temp_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        # total_vid_frames = int(temp_cap.get(cv2.CAP_PROP_FRAME_COUNT)) # Get total frames for mover
         temp_cap.release()
         if vid_width <= 0 or vid_height <= 0:
              raise ValueError(f"获取到的视频尺寸无效: {vid_width}x{vid_height}")
@@ -446,7 +509,6 @@ def process_single_video_worker(args):
         opacity = common_params['watermark_opacity']
 
         if watermark_type == "文本":
-            # Unpack text params
             wp = watermark_params # shortcut
             status_message += f"  创建文本水印: '{wp['text_content'][:30]}...' 尺寸:{wp['font_size']}pt Opacity:{opacity}%\n"
             watermark_pil = create_text_watermark(
@@ -456,7 +518,6 @@ def process_single_video_worker(args):
                 shadow_offset_x=wp['shadow_offset_x'], shadow_offset_y=wp['shadow_offset_y'], shadow_color_hex=wp['shadow_color']
             )
         elif watermark_type == "图片":
-            # Unpack image params
             ip = watermark_params # shortcut
             status_message += f"  加载图片水印: 缩放:{ip['image_scale']}% Opacity:{opacity}%\n"
             watermark_pil = load_image_watermark(
@@ -469,7 +530,7 @@ def process_single_video_worker(args):
             raise ValueError("水印创建失败或尺寸无效。")
         status_message += f"  水印已生成，尺寸: {watermark_pil.width}x{watermark_pil.height}\n"
 
-        # --- Resize watermark if it's larger than frame (rare case after scaling, but safety check) ---
+        # --- Resize watermark if it's larger than frame ---
         if watermark_pil.width > vid_width or watermark_pil.height > vid_height:
              print(f"警告: 水印尺寸 ({watermark_pil.width}x{watermark_pil.height}) 超出帧尺寸 ({vid_width}x{vid_height})。将调整水印大小以适应。")
              ratio = min(vid_width / watermark_pil.width, vid_height / watermark_pil.height)
@@ -481,8 +542,6 @@ def process_single_video_worker(args):
                  status_message += f"  水印已调整大小为: {new_w}x{new_h}\n"
              except Exception as resize_err:
                  status_message += f"  警告: 调整水印大小时出错: {resize_err}。\n"
-                 # Continue with potentially clipped watermark
-
 
         # --- Initialize Mover ---
         mp = motion_params # shortcut
@@ -493,24 +552,45 @@ def process_single_video_worker(args):
         )
         status_message += f"  初始化移动器: 类型:{mp['motion_path']}, 边距:{mp['motion_margin']}%, 速度:{mp['motion_speed']}x\n"
 
-        # --- Add Watermark to Video ---
-        add_watermark_to_video(input_path, output_path, watermark_pil, mover)
+        # --- STEP 1: Add Watermark to Video (create silent temp file) ---
+        add_watermark_to_video(input_path, temp_silent_path, watermark_pil, mover)
+        status_message += f"  已生成带水印的无声视频: {temp_silent_path.name}\n"
 
-        status_message += f"  成功处理并保存到: {output_path}\n"
-        return status_message, str(output_path) # Return success message and path
+        # --- STEP 2: Combine with original audio using FFmpeg ---
+        success, ffmpeg_msg = _combine_video_audio_ffmpeg(temp_silent_path, input_path, final_output_path)
+        if not success:
+             status_message += f"  FFmpeg 合并失败: {ffmpeg_msg}\n"
+             # Keep the silent video as a fallback? Or report total failure?
+             # Reporting total failure seems better. The silent file will be cleaned up in finally.
+             raise Exception(f"FFmpeg 合并音频失败: {ffmpeg_msg}") # Raise to trigger finally block cleanup
+        else:
+            status_message += f"  成功合并音频并保存到: {final_output_path}\n"
+
+        return status_message, str(final_output_path) # Return success message and FINAL path
 
     except Exception as e:
         error_msg = f"错误 处理 {input_path.name} 时发生错误: {type(e).__name__}: {e}\n"
         print(f"!!! {error_msg.strip()}") # Log full error to console
         status_message += error_msg
-        # Clean up partially created output file if it exists
-        if output_path.exists():
+        # Clean up potentially created final output file if FFmpeg failed AFTER creating it (unlikely but possible)
+        if final_output_path.exists():
              try:
-                 output_path.unlink()
-                 status_message += f"  已删除部分生成的输出文件: {output_path.name}\n"
+                 final_output_path.unlink()
+                 status_message += f"  已删除可能存在的部分最终文件: {final_output_path.name}\n"
              except OSError as rm_err:
-                 status_message += f"  警告: 无法删除部分文件 {output_path.name}: {rm_err}\n"
+                 status_message += f"  警告: 无法删除部分最终文件 {final_output_path.name}: {rm_err}\n"
         return status_message, None # Return error message and None path
+
+    finally:
+         # --- Clean up temporary silent file ---
+         if temp_silent_path.exists():
+             try:
+                 temp_silent_path.unlink()
+                 print(f"  已删除临时文件: {temp_silent_path.name}")
+                 status_message += f"  已删除临时文件: {temp_silent_path.name}\n"
+             except OSError as e:
+                 print(f"警告: 无法删除临时文件 {temp_silent_path}: {e}")
+                 status_message += f"  警告: 无法删除临时文件 {temp_silent_path.name}: {e}\n"
 
 
 # --- Gradio Interface Function ---
@@ -534,6 +614,13 @@ def process_videos_interface(
     if not input_videos:
         return "错误: 未选择任何输入视频文件。", [], None
 
+    # --- Check for FFmpeg ---
+    if not is_ffmpeg_available():
+        return ("错误: FFmpeg 未找到。\n"
+                "请确保 FFmpeg 已安装并添加到系统 PATH 环境变量中。\n"
+                "可以从 https://ffmpeg.org/download.html 下载。\n"
+                "音频将无法保留。"), [], None
+
     output_base = Path(output_dir_name if output_dir_name else DEFAULT_OUTPUT_DIR)
     try:
         output_base.mkdir(parents=True, exist_ok=True)
@@ -552,13 +639,13 @@ def process_videos_interface(
 
     # --- Font File Handling ---
     if watermark_type == "文本":
-        if font_file is not None:
-            final_font_path = font_file.name # Path from Gradio TempFile
+        if font_file is not None: # font_file is now the path string
+            final_font_path = font_file
             if not Path(final_font_path).exists():
-                 status_messages.append(f"警告: 上传的字体文件路径 '{final_font_path}' 无效。尝试使用默认字体。")
-                 final_font_path = None
+                status_messages.append(f"警告: 上传的字体文件路径 '{final_font_path}' 无效。尝试使用默认字体。")
+                final_font_path = None # Reset if path is invalid
             else:
-                 status_messages.append(f"使用上传的字体: {Path(final_font_path).name}")
+                status_messages.append(f"使用上传的字体: {Path(final_font_path).name}")
         else:
             status_messages.append(f"未提供字体文件。尝试使用默认字体: {DEFAULT_FONT_PATH}")
 
@@ -578,14 +665,14 @@ def process_videos_interface(
         }
     # --- Image File Handling ---
     elif watermark_type == "图片":
-        if image_file is not None:
-            image_watermark_path = image_file.name # Path from Gradio TempFile
+        if image_file is not None: # image_file is now the path string
+            image_watermark_path = image_file
             if not Path(image_watermark_path).exists():
-                 status_messages.append(f"错误: 上传的图片文件路径 '{image_watermark_path}' 无效。")
-                 return "\n".join(status_messages), [], None
+                status_messages.append(f"错误: 上传的图片文件路径 '{image_watermark_path}' 无效。")
+                return "\n".join(status_messages), [], None
             else:
-                 status_messages.append(f"使用上传的图片: {Path(image_watermark_path).name}")
-                 watermark_params = {'image_path': image_watermark_path, 'image_scale': image_scale}
+                status_messages.append(f"使用上传的图片: {Path(image_watermark_path).name}")
+                watermark_params = {'image_path': image_watermark_path, 'image_scale': image_scale}
         else:
              status_messages.append(f"错误: 选择了图片水印类型，但未提供图片文件。")
              return "\n".join(status_messages), [], None
@@ -595,53 +682,37 @@ def process_videos_interface(
     }
 
     # --- Prepare Arguments for Workers ---
-    task_args = []
-    for video_file in input_videos:
-        input_path_str = video_file.name # Get path from Gradio file object
-        task_args.append((
+    task_args_list = []
+    for video_file_path in input_videos: # video_file_path is now the string path
+        input_path_str = video_file_path
+        task_args_list.append((
             input_path_str, str(output_base), watermark_params, motion_params, common_params
-        ))
+    ))
 
-    # --- Process Using Multiprocessing Pool ---
-    num_workers = os.cpu_count()
-    status_messages.append(f"\n开始使用 {num_workers} 个 CPU 核心处理 {len(task_args)} 个视频...")
-    print(f"开始使用 {num_workers} 个 CPU 核心处理 {len(task_args)} 个视频...")
+    # --- Process Sequentially ---
+    status_messages.append(f"\n开始顺序处理 {len(task_args_list)} 个视频...")
+    print(f"开始顺序处理 {len(task_args_list)} 个视频...")
 
     output_file_paths = []
     processed_count = 0
-    total_videos = len(task_args)
+    total_videos = len(task_args_list)
 
-    # Use try-finally to ensure pool cleanup
-    pool = None
-    try:
-        # Use context manager for pool if Python >= 3.3
-        # with multiprocessing.Pool(processes=num_workers) as pool:
-        pool = multiprocessing.Pool(processes=num_workers)
-        # Use imap_unordered to get results as they complete for better progress feedback
-        results_iterator = pool.imap_unordered(process_single_video_worker, task_args)
+    for i, task_args in enumerate(task_args_list):
+        progress_desc = f"正在处理第 {i+1}/{total_videos} 个视频: {Path(task_args_list[i][0]).name}" # Access path from the stored args
+        progress((i + 0.1) / total_videos, desc=progress_desc) # Show progress early for current video
 
-        # Update progress as each video finishes
-        for result in results_iterator:
-            processed_count += 1
-            message, output_path = result
-            status_messages.append(f"\n--- 结果 ({processed_count}/{total_videos}) ---")
-            status_messages.append(message.strip())
-            if output_path:
-                output_file_paths.append(output_path)
+        print(f"\n--- ({i+1}/{total_videos}) 处理视频: {Path(task_args_list[i][0]).name} ---") # Access path from the stored args
+        message, output_path = process_single_video_worker(task_args)
 
-            # Update Gradio progress bar
-            progress(processed_count / total_videos, desc=f"已处理 {processed_count}/{total_videos} 个视频")
+        processed_count += 1
+        status_messages.append(f"\n--- 结果 ({processed_count}/{total_videos}) ---")
+        status_messages.append(message.strip())
+        if output_path:
+            output_file_paths.append(output_path)
 
-        pool.close()
-        pool.join()
+        # Update Gradio progress bar after finishing one video
+        progress(processed_count / total_videos, desc=f"已完成 {processed_count}/{total_videos} 个视频")
 
-    except Exception as pool_err:
-        error_msg = f"!!! 多进程处理时发生严重错误: {pool_err}"
-        print(error_msg)
-        status_messages.append(error_msg)
-    finally:
-        if pool:
-            pool.terminate() # Force terminate if something went wrong
 
     status_messages.append("\n批量处理完成。")
     final_status = "\n".join(status_messages)
@@ -651,7 +722,7 @@ def process_videos_interface(
     return final_status, output_file_paths, None
 
 
-# --- Preview Function ---
+# --- Preview Function (Remains the same, as it only needs one frame) ---
 def generate_preview(
     input_videos, # Need this to get a frame
     watermark_type,
@@ -668,14 +739,16 @@ def generate_preview(
     if not input_videos:
         img = Image.new('RGB', (300, 100), color = 'black')
         d = ImageDraw.Draw(img)
-        try: font = ImageFont.truetype("arial.ttf", 15)
+        try: font = ImageFont.truetype("arial.ttf", 15) # Try basic arial
         except IOError: font = ImageFont.load_default()
         d.text((10,10), "请先上传一个视频文件\n才能生成预览", fill='white', font=font)
         return img
 
     preview_status = ""
+    final_font_path_preview = None
     try:
-        input_path = Path(input_videos[0].name) # Use the first video
+        # input_videos[0] is a TemporaryFileWrapper object
+        input_path = Path(input_videos[0]) # Use the first video path directly
         preview_status += f"使用视频 '{input_path.name}' 的一帧进行预览。\n"
 
         cap = cv2.VideoCapture(str(input_path))
@@ -699,28 +772,47 @@ def generate_preview(
 
         # --- Prepare Watermark ---
         watermark_pil = None
-        final_font_path_preview = None
         if watermark_type == "文本":
             # Font path logic for preview
-            if font_file is not None and Path(font_file.name).exists():
-                 final_font_path_preview = font_file.name
+            if font_file is not None and Path(font_file).exists(): # font_file is the path string
+                final_font_path_preview = font_file
             elif Path(DEFAULT_FONT_PATH).exists():
                  final_font_path_preview = DEFAULT_FONT_PATH
-            if final_font_path_preview is None:
-                 raise ValueError("预览需要字体，但未提供或找不到默认字体。")
 
-            watermark_pil = create_text_watermark(
-                text=text_content, font_path=final_font_path_preview, font_size=font_size, color_hex=text_color,
-                opacity_percent=watermark_opacity,
-                stroke_width=stroke_width, stroke_color_hex=stroke_color,
-                shadow_offset_x=shadow_offset_x, shadow_offset_y=shadow_offset_y, shadow_color_hex=shadow_color
-            )
-            preview_status += f"创建文本水印 (字体: {Path(final_font_path_preview).name}, 尺寸: {font_size}pt, Opacity: {watermark_opacity}%)\n"
+            if final_font_path_preview is None:
+                 # Try Pillow default as last resort for preview only
+                 print("警告 (预览): 未找到指定或默认字体，尝试 Pillow 默认字体。")
+                 try:
+                     font = ImageFont.load_default()
+                     # Use load_default() within create_text_watermark is tricky,
+                     # so create a minimal watermark here for preview
+                     temp_img = Image.new('RGBA', (1,1)) # Placeholder
+                     draw = ImageDraw.Draw(temp_img)
+                     bbox = draw.textbbox((0,0), text_content, font=font)
+                     w = bbox[2] - bbox[0]
+                     h = bbox[3] - bbox[1]
+                     img = Image.new('RGBA', (w, h), (255, 255, 255, 0))
+                     draw = ImageDraw.Draw(img)
+                     rgba_color = hex_to_rgba(text_color, alpha=int(255 * (watermark_opacity / 100.0)))
+                     draw.text((-bbox[0], -bbox[1]), text_content, font=font, fill=rgba_color)
+                     watermark_pil = img
+                     preview_status += f"创建文本水印 (Pillow 默认字体, Opacity: {watermark_opacity}%)\n"
+                 except Exception as e_def:
+                     raise ValueError(f"预览需要字体，但未提供、找不到默认字体或无法加载 Pillow 默认字体: {e_def}")
+            else:
+                watermark_pil = create_text_watermark(
+                    text=text_content, font_path=final_font_path_preview, font_size=font_size, color_hex=text_color,
+                    opacity_percent=watermark_opacity,
+                    stroke_width=stroke_width, stroke_color_hex=stroke_color,
+                    shadow_offset_x=shadow_offset_x, shadow_offset_y=shadow_offset_y, shadow_color_hex=shadow_color
+                )
+                preview_status += f"创建文本水印 (字体: {Path(final_font_path_preview).name}, 尺寸: {font_size}pt, Opacity: {watermark_opacity}%)\n"
+
 
         elif watermark_type == "图片":
-            if image_file is None or not Path(image_file.name).exists():
+            if image_file is None or not Path(image_file).exists(): # image_file is the path string
                 raise ValueError("预览需要图片，但未提供或文件无效。")
-            image_watermark_path_preview = image_file.name
+            image_watermark_path_preview = image_file
             watermark_pil = load_image_watermark(
                 image_watermark_path_preview, image_scale, vid_width, vid_height, watermark_opacity
             )
@@ -732,13 +824,29 @@ def generate_preview(
              raise ValueError("预览时水印创建失败或尺寸无效。")
         preview_status += f"水印尺寸: {watermark_pil.width}x{watermark_pil.height}\n"
 
+        # --- Resize watermark if it's larger than frame (for preview safety) ---
+        if watermark_pil.width > vid_width or watermark_pil.height > vid_height:
+             print(f"警告 (预览): 水印尺寸 ({watermark_pil.width}x{watermark_pil.height}) 超出帧尺寸 ({vid_width}x{vid_height})。将调整水印大小以适应预览。")
+             ratio = min(vid_width / watermark_pil.width, vid_height / watermark_pil.height)
+             new_w = max(1, int(watermark_pil.width * ratio))
+             new_h = max(1, int(watermark_pil.height * ratio))
+             try:
+                 resample_filter = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS
+                 watermark_pil = watermark_pil.resize((new_w, new_h), resample_filter)
+                 preview_status += f"  预览水印已调整大小为: {new_w}x{new_h}\n"
+             except Exception as resize_err:
+                 preview_status += f"  警告 (预览): 调整预览水印大小时出错: {resize_err}。\n"
+
+
         # --- Initialize Mover ---
         mover = WatermarkMover(
             path_type=motion_path, frame_width=vid_width, frame_height=vid_height,
             watermark_width=watermark_pil.width, watermark_height=watermark_pil.height,
             margin_percent=motion_margin, speed_factor=motion_speed
         )
-        mover.update_total_frames(total_frames) # Give mover frame count hint
+        # Give mover frame count hint for cyclic paths like horizontal/vertical move
+        if total_frames and total_frames > 0:
+             mover.update_total_frames(total_frames)
 
         # --- Get Position & Composite ---
         wm_x, wm_y = mover.get_position(frame_to_preview)
@@ -750,10 +858,16 @@ def generate_preview(
         pil_frame = Image.fromarray(frame_rgb).convert("RGBA")
 
         # Composite (using paste with mask)
-        if watermark_pil.mode == 'RGBA' and watermark_pil.getextrema()[3][1] > 0: # Check if alpha max > 0
-            pil_frame.paste(watermark_pil, (wm_x, wm_y), mask=watermark_pil)
-        elif watermark_pil.mode != 'RGBA': # Assume opaque if not RGBA
-            pil_frame.paste(watermark_pil, (wm_x, wm_y))
+        has_visible_watermark_preview = False
+        if watermark_pil.mode == 'RGBA':
+             try:
+                 alpha_min, alpha_max = watermark_pil.getextrema()[3]
+                 if alpha_max > 0: has_visible_watermark_preview = True
+             except IndexError: has_visible_watermark_preview = True # Assume visible
+        else: has_visible_watermark_preview = True
+
+        if has_visible_watermark_preview:
+             pil_frame.paste(watermark_pil, (wm_x, wm_y), mask=watermark_pil)
 
 
         preview_status += "预览图生成成功。"
@@ -762,7 +876,7 @@ def generate_preview(
 
     except Exception as e:
         error_msg = f"生成预览时出错: {type(e).__name__}: {e}"
-        print(error_msg)
+        print(f"!!! {error_msg}")
         img = Image.new('RGB', (400, 150), color = 'darkred')
         d = ImageDraw.Draw(img)
         try: font = ImageFont.truetype("arial.ttf", 15)
@@ -771,11 +885,10 @@ def generate_preview(
         import textwrap
         lines = textwrap.wrap(f"生成预览失败:\n{error_msg}", width=50)
         y_text = 10
+        line_height = 18 # Estimate line height
         for line in lines:
-            width, height = font.getsize(line) if hasattr(font, 'getsize') else (10*len(line), 15) # Basic fallback
             d.text((10, y_text), line, font=font, fill='white')
-            y_text += height + 2 # Move y down for next line
-        # d.text((10,10), f"生成预览失败:\n{error_msg}", fill='white', font=font)
+            y_text += line_height
         return img
 
 
@@ -786,13 +899,13 @@ default_font_exists = Path(DEFAULT_FONT_PATH).exists()
 default_font_warning = f" (默认: {Path(DEFAULT_FONT_PATH).name}{'' if default_font_exists else ' - 未找到!'})"
 
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🎬 视频水印添加工具 (增强版)")
-    gr.Markdown("为视频添加动态文本或图片水印。支持文本描边/阴影、文件名防覆盖、多核处理加速。")
+    gr.Markdown("# 🎬 视频水印添加工具 (顺序处理 + 保留音频)")
+    gr.Markdown("为视频添加动态文本或图片水印。**按顺序处理，并使用 FFmpeg 保留原始音频** (需预先安装 FFmpeg)。")
 
     with gr.Row():
         with gr.Column(scale=3): # Input settings column slightly wider
             gr.Markdown("### 1. 输入视频")
-            input_videos = gr.Files(label="上传视频文件 (可多选)", file_types=['video'], type="filepath") # Use filepath
+            input_videos = gr.Files(label="上传视频文件 (可多选)", file_types=['video'], type="filepath")
 
             gr.Markdown("### 2. 水印设置")
             watermark_type = gr.Radio(["文本", "图片"], label="水印类型", value="文本")
@@ -804,7 +917,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             with gr.Group(visible=True) as text_options:
                 gr.Markdown("#### 文本水印选项")
                 text_content = gr.Textbox(label="水印文字", value="在此输入水印内容", lines=2)
-                font_file = gr.File(label=f"上传字体文件 (.ttf, .otf) {default_font_warning}", file_types=['.ttf', '.otf'], type="filepath") # Use filepath
+                font_file = gr.File(label=f"上传字体文件 (.ttf, .otf) {default_font_warning}", file_types=['.ttf', '.otf'], type="filepath")
                 font_size = gr.Slider(label="字体大小 (pt)", minimum=8, maximum=300, value=48, step=1)
                 text_color = gr.ColorPicker(label="文字颜色 (Hex)", value="#FFFFFF")
                 with gr.Accordion("描边 & 阴影 (可选)", open=False):
@@ -819,7 +932,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             # --- Image Options ---
             with gr.Group(visible=False) as image_options:
                  gr.Markdown("#### 图片水印选项")
-                 image_file = gr.File(label="上传水印图片", file_types=['image'], type="filepath") # Use filepath
+                 image_file = gr.File(label="上传水印图片", file_types=['image'], type="filepath")
                  image_scale = gr.Slider(label="图片缩放比例 (%) - 相对于视频最大边长", minimum=1, maximum=50, value=10, step=1)
 
             # --- Motion Settings ---
@@ -845,13 +958,13 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             preview_output = gr.Image(label="效果预览", type="pil", interactive=False)
 
             gr.Markdown("### 6. 开始处理")
-            process_button = gr.Button("🚀 开始添加水印 (多核处理)", variant="primary")
+            process_button = gr.Button("🚀 开始添加水印 (顺序处理)", variant="primary")
 
             gr.Markdown("### 状态日志")
             status_output = gr.Textbox(label="运行日志", lines=15, interactive=False, autoscroll=True)
 
             gr.Markdown("### 输出文件")
-            output_files_display = gr.Files(label="生成的水印视频", interactive=False)
+            output_files_display = gr.Files(label="生成的水印视频", interactive=False) # Display output files
 
 
     # --- UI Logic ---
@@ -864,6 +977,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     watermark_type.change(update_visibility, inputs=watermark_type, outputs=[text_options, image_options])
 
     # Gather all inputs needed for preview and processing
+    # Note: Use the component itself, Gradio handles getting the value
     proc_inputs = [
             input_videos, watermark_type,
             # Text
@@ -902,22 +1016,33 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     process_button.click(
         fn=process_videos_interface,
         inputs=proc_inputs,
-        outputs=[status_output, output_files_display, preview_output] # Pass None to preview output
+        # Output the status log, the list of file paths, and clear the preview
+        outputs=[status_output, output_files_display, preview_output]
     )
 
     gr.Markdown("---")
-    gr.Markdown(f"**提示:** 处理多个或长视频时，将自动使用多核 CPU 加速。确保有足够的磁盘空间。默认字体 '{DEFAULT_FONT_PATH}' {'存在' if default_font_exists else '未找到'}。")
+    ffmpeg_exists = is_ffmpeg_available()
+    ffmpeg_status = "**可用**" if ffmpeg_exists else "**未找到!** (音频将无法保留)"
+    gr.Markdown(f"**依赖检查:** FFmpeg {ffmpeg_status}")
+    gr.Markdown(f"**提示:** 视频将按顺序处理。确保有足够的磁盘空间。默认字体 '{DEFAULT_FONT_PATH}' {'存在' if default_font_exists else '未找到'}。")
 
 
 # Launch the Gradio app
 if __name__ == "__main__":
-     # Required for multiprocessing pool to work correctly on some OS (like Windows)
-    multiprocessing.freeze_support()
+     # multiprocessing.freeze_support() # No longer needed
 
     if not default_font_exists:
         print(f"警告: 默认字体 '{DEFAULT_FONT_PATH}' 未找到。")
         print("除非通过界面上传字体文件，否则文本水印功能可能无法正常工作或显示异常。")
 
-    print(f"系统 CPU 核心数: {os.cpu_count()}")
+    if not is_ffmpeg_available():
+         print("#############################################################")
+         print("警告: FFmpeg 命令未在系统 PATH 中找到!")
+         print("音频将无法从原始视频复制到输出视频。")
+         print("请从 https://ffmpeg.org/download.html 下载并安装 FFmpeg，")
+         print("并确保将其添加到您的环境变量 PATH 中。")
+         print("#############################################################")
+
+    # print(f"系统 CPU 核心数: {os.cpu_count()}") # Less relevant now
     print("正在启动 Gradio 界面...")
     demo.launch()
